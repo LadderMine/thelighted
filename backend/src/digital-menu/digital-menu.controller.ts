@@ -7,7 +7,7 @@ export class DigitalMenuController {
   constructor(private readonly service: DigitalMenuService) {}
 
   @Get('public/:qrCode')
-  @Throttle(100, 60)
+  @Throttle({ default: { limit: 100, ttl: 60000 } })
   getMenu(@Param('qrCode') code: string) {
     return this.service.getMenuByQRCode(code);
   }

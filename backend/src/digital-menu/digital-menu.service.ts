@@ -2,7 +2,7 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { QRCode } from '../qr-codes/entities/qr-code.entity';
-import * as UAParser from 'ua-parser-js';
+import { UAParser } from 'ua-parser-js';
 
 @Injectable()
 export class DigitalMenuService {

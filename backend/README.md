@@ -26,6 +26,42 @@
 
 [Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
 
+## Stellar Blockchain Payment Integration
+
+This project includes a comprehensive Stellar blockchain payment integration supporting:
+
+- ✅ XLM and USDC cryptocurrency payments
+- ✅ Wallet management (Freighter, Albedo, Lobstr)
+- ✅ Tokenized loyalty program
+- ✅ Real-time exchange rates
+- ✅ Transaction confirmation and tracking
+- ✅ Automatic loyalty token distribution
+- ✅ Refund processing
+- ✅ Background job processing for rate updates and transaction polling
+
+For detailed documentation, see [src/payments/README_STELLAR.md](./src/payments/README_STELLAR.md).
+
+### API Endpoints
+
+#### Payment Processing
+- `POST /api/payments/stellar/initiate` - Initiate Stellar payment
+- `POST /api/payments/stellar/confirm` - Confirm payment received
+- `GET /api/payments/stellar/:transactionHash` - Get transaction details
+- `POST /api/payments/stellar/refund` - Process refund
+
+#### Wallet Management
+- `POST /api/wallets/connect` - Connect Stellar wallet
+- `GET /api/wallets/balance` - Get wallet balance
+- `GET /api/wallets/transactions` - Get transaction history
+- `POST /api/wallets/verify` - Verify wallet ownership
+
+#### Loyalty Tokens
+- `POST /api/loyalty/tokens/create` - Create restaurant loyalty token
+- `POST /api/loyalty/tokens/issue` - Issue tokens to customer
+- `GET /api/loyalty/tokens/:tokenCode` - Get token info
+- `GET /api/loyalty/tokens/holders` - Get token holders
+- `POST /api/loyalty/tokens/redeem` - Redeem tokens for rewards
+
 ## Project setup
 
 ```bash
