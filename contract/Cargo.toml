@@ -1,6 +1,6 @@
-[package]
-name = "contract"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = ["payment-escrow"]
+resolver = "2"
 
-[dependencies]
+[workspace.dependencies]
+soroban-sdk = "20.0.0"

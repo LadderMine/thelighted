@@ -19,7 +19,24 @@
     "react-window": "^2.2.5",
     "recharts": "^3.7.0",
     "socket.io-client": "^4.8.3",
-    "zustand": "^5.0.10"
+    "zustand": "^5.0.10",
+    "@hookform/resolvers": "^5.2.2",
+    "@tanstack/react-query-devtools": "^5.91.0",
+    "@tanstack/react-table": "^8.21.3",
+    "@vercel/analytics": "^1.5.0",
+    "@vercel/speed-insights": "^1.2.0",
+    "date-fns": "^4.1.0",
+    "embla-carousel-react": "^8.6.0",
+    "framer-motion": "^12.23.24",
+    "next-seo": "^7.0.1",
+    "plaiceholder": "^3.0.0",
+    "qrcode.react": "^4.2.0",
+    "react-hook-form": "^7.66.0",
+    "react-hot-toast": "^2.6.0",
+    "react-intersection-observer": "^10.0.0",
+    "sharp": "^0.34.5",
+    "sonner": "^2.0.7",
+    "zod": "^4.1.12"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
@@ -29,6 +46,7 @@
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "15.5.9",
+    "postcss": "^8.5.6",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

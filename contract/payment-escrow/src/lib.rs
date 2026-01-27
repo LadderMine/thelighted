@@ -1,7 +1,12 @@
+// contract/payment-escrow/src/lib.rs
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token, Address, Env, Symbol, Val,
+    contract, contractimpl, contracttype, token, Address, Env,
 };
+
+const TWENTY_FOUR_HOURS: u64 = 24 * 60 * 60; // 24 hours in seconds
+const STORAGE_LIFETIME_THRESHOLD: u32 = 518400; // ~60 days
+const STORAGE_BUMP_AMOUNT: u32 = 1036800; // ~120 days
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -43,6 +48,11 @@ impl OrderEscrowContract {
         // Authenticate customer to ensure they are initiating this
         customer.require_auth();
 
+        // Validate inputs
+        if amount <= 0 {
+            panic!("Amount must be positive");
+        }
+
         // Check if order already exists
         if env.storage().persistent().has(&order_id) {
             panic!("Order ID already exists");
@@ -52,9 +62,8 @@ impl OrderEscrowContract {
         let token_client = token::Client::new(&env, &asset);
         token_client.transfer(&customer, &env.current_contract_address(), &amount);
 
-        // 24 hours in seconds (assuming 5s ledger time, but using timestamp directly)
         let now = env.ledger().timestamp();
-        let expiry = now + (24 * 60 * 60);
+        let expiry = now + TWENTY_FOUR_HOURS;
 
         let escrow = Escrow {
             customer,
@@ -66,7 +75,11 @@ impl OrderEscrowContract {
             expiry,
         };
 
+        // Store with TTL management
         env.storage().persistent().set(&order_id, &escrow);
+        env.storage()
+            .persistent()
+            .extend_ttl(&order_id, STORAGE_LIFETIME_THRESHOLD, STORAGE_BUMP_AMOUNT);
     }
 
     /// Release funds to the restaurant
@@ -77,10 +90,7 @@ impl OrderEscrowContract {
             panic!("Escrow is not in a locked state");
         }
 
-        // Only the customer (confirming receipt) or an admin/restaurant can trigger this
-        // For this logic, we'll assume the restaurant claims it, or an admin oracle triggers it.
-        // Let's require the restaurant to claim, OR customer to release. 
-        // For safety here: Customer must sign off to release to restaurant.
+        // Customer must sign off to release to restaurant
         escrow.customer.require_auth();
 
         let token_client = token::Client::new(&env, &escrow.asset);
@@ -88,6 +98,9 @@ impl OrderEscrowContract {
 
         escrow.status = EscrowStatus::Completed;
         env.storage().persistent().set(&order_id, &escrow);
+        env.storage()
+            .persistent()
+            .extend_ttl(&order_id, STORAGE_LIFETIME_THRESHOLD, STORAGE_BUMP_AMOUNT);
     }
 
     /// Full refund to customer (Cancellation or Timeout)
@@ -112,6 +125,9 @@ impl OrderEscrowContract {
 
         escrow.status = EscrowStatus::Refunded;
         env.storage().persistent().set(&order_id, &escrow);
+        env.storage()
+            .persistent()
+            .extend_ttl(&order_id, STORAGE_LIFETIME_THRESHOLD, STORAGE_BUMP_AMOUNT);
     }
 
     /// Partial refund (e.g., missing items)
@@ -124,6 +140,11 @@ impl OrderEscrowContract {
 
         if escrow.status != EscrowStatus::Locked {
             panic!("Escrow is not in a locked state");
+        }
+        
+        // Validate refund amount
+        if refund_amount <= 0 {
+            panic!("Refund amount must be positive");
         }
         if refund_amount >= escrow.amount {
             panic!("Partial refund cannot exceed total amount");
@@ -139,9 +160,16 @@ impl OrderEscrowContract {
 
         escrow.status = EscrowStatus::PartialRefunded;
         env.storage().persistent().set(&order_id, &escrow);
+        env.storage()
+            .persistent()
+            .extend_ttl(&order_id, STORAGE_LIFETIME_THRESHOLD, STORAGE_BUMP_AMOUNT);
     }
 
+    /// Get escrow details for an order
     pub fn get_escrow_details(env: Env, order_id: u64) -> Escrow {
         env.storage().persistent().get(&order_id).expect("Order not found")
     }
 }
+
+#[cfg(test)]
+mod test;
