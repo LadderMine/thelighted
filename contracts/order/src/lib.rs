@@ -239,3 +239,240 @@ impl OrderContract {
             (order_id, caller),
         );
     }
+
+    
+    // -----------------------------------------------------------------------
+    // Restaurant / Admin actions
+    // -----------------------------------------------------------------------
+
+    /// Advance the order to the next status in the lifecycle.
+    ///
+    /// Only the contract admin may call this; in production you would add a
+    /// check against the restaurant registry to allow restaurant owners too.
+    ///
+    /// Valid transitions (in order):
+    /// `Pending → Confirmed → Preparing → Ready → Delivered`
+    pub fn advance_status(env: Env, caller: Address, order_id: u64) {
+        caller.require_auth();
+        Self::assert_admin_or_panic(&env, &caller);
+
+        let mut order = Self::load_order(&env, order_id);
+
+        order.status = match order.status {
+            OrderStatus::Pending => OrderStatus::Confirmed,
+            OrderStatus::Confirmed => OrderStatus::Preparing,
+            OrderStatus::Preparing => OrderStatus::Ready,
+            OrderStatus::Ready => OrderStatus::Delivered,
+            OrderStatus::Delivered => panic!("order already delivered"),
+            OrderStatus::Cancelled => panic!("cannot advance a cancelled order"),
+        };
+        order.updated_at = env.ledger().timestamp();
+        Self::save_order(&env, &order);
+
+        env.events().publish(
+            (symbol_short!("advanced"), symbol_short!("order")),
+            order_id,
+        );
+    }
+
+    /// Directly set an order's status (admin only – for dispute resolution).
+    pub fn set_status(env: Env, caller: Address, order_id: u64, status: OrderStatus) {
+        caller.require_auth();
+        Self::assert_admin_or_panic(&env, &caller);
+
+        let mut order = Self::load_order(&env, order_id);
+        order.status = status;
+        order.updated_at = env.ledger().timestamp();
+        Self::save_order(&env, &order);
+
+        env.events().publish(
+            (symbol_short!("setstatus"), symbol_short!("order")),
+            order_id,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // View functions
+    // -----------------------------------------------------------------------
+
+    /// Fetch a single order by ID.
+    pub fn get_order(env: Env, order_id: u64) -> Order {
+        Self::load_order(&env, order_id)
+    }
+
+    /// Return a list of order IDs for a restaurant.
+    pub fn get_restaurant_orders(env: Env, restaurant_id: u64) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RestaurantOrders(restaurant_id))
+            .unwrap_or_else(|| vec![&env])
+    }
+
+    /// Return a list of order IDs for a customer.
+    pub fn get_customer_orders(env: Env, customer: Address) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CustomerOrders(customer))
+            .unwrap_or_else(|| vec![&env])
+    }
+
+    /// Total orders ever placed.
+    pub fn get_count(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::Count).unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Private helpers
+    // -----------------------------------------------------------------------
+
+    fn load_order(env: &Env, order_id: u64) -> Order {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Order(order_id))
+            .unwrap_or_else(|| panic!("order not found"))
+    }
+
+    fn save_order(env: &Env, order: &Order) {
+        let ttl: u32 = 2_073_600;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Order(order.id), order);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Order(order.id), ttl, ttl);
+    }
+
+    fn assert_admin_or_panic(env: &Env, caller: &Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != &admin {
+            panic!("unauthorized: admin only");
+        }
+    }
+
+    fn append_to_list(env: &Env, key: DataKey, id: u64, ttl: u32) {
+        let mut list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| vec![env]);
+        list.push_back(id);
+        env.storage().persistent().set(&key, &list);
+        env.storage().persistent().extend_ttl(&key, ttl, ttl);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{vec, Env, String};
+
+    fn make_item(env: &Env, id: u64, qty: u32, price: i128) -> OrderItem {
+        OrderItem {
+            menu_item_id: id,
+            name: String::from_str(env, "Jollof Rice"),
+            quantity: qty,
+            unit_price: price,
+        }
+    }
+
+    fn setup() -> (Env, OrderContractClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, OrderContract);
+        let client = OrderContractClient::new(&env, &cid);
+        (env, client)
+    }
+
+    #[test]
+    fn test_place_and_get_order() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let customer = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        let items = vec![&env, make_item(&env, 1, 2, 5_000_000)]; // 2 × 0.5 XLM
+        let id = client.place_order(
+            &customer,
+            &42,
+            &items,
+            &String::from_str(&env, "No onions please"),
+        );
+
+        assert_eq!(id, 1);
+        let order = client.get_order(&id);
+        assert_eq!(order.total_amount, 10_000_000);
+        assert_eq!(order.status, OrderStatus::Pending);
+    }
+
+    #[test]
+    fn test_advance_status() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let customer = Address::generate(&env);
+        client.initialize(&admin);
+
+        let items = vec![&env, make_item(&env, 1, 1, 7_000_000)];
+        let id = client.place_order(&customer, &1, &items, &String::from_str(&env, ""));
+
+        client.advance_status(&admin, &id);
+        assert_eq!(client.get_order(&id).status, OrderStatus::Confirmed);
+
+        client.advance_status(&admin, &id);
+        assert_eq!(client.get_order(&id).status, OrderStatus::Preparing);
+
+        client.advance_status(&admin, &id);
+        assert_eq!(client.get_order(&id).status, OrderStatus::Ready);
+
+        client.advance_status(&admin, &id);
+        assert_eq!(client.get_order(&id).status, OrderStatus::Delivered);
+    }
+
+    #[test]
+    fn test_customer_cancel_pending() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let customer = Address::generate(&env);
+        client.initialize(&admin);
+
+        let items = vec![&env, make_item(&env, 2, 1, 3_000_000)];
+        let id = client.place_order(&customer, &1, &items, &String::from_str(&env, ""));
+
+        client.cancel_order(&customer, &id);
+        assert_eq!(client.get_order(&id).status, OrderStatus::Cancelled);
+    }
+
+    #[test]
+    #[should_panic(expected = "customers may only cancel pending orders")]
+    fn test_customer_cannot_cancel_confirmed() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let customer = Address::generate(&env);
+        client.initialize(&admin);
+
+        let items = vec![&env, make_item(&env, 1, 1, 5_000_000)];
+        let id = client.place_order(&customer, &1, &items, &String::from_str(&env, ""));
+        client.advance_status(&admin, &id);
+        client.cancel_order(&customer, &id);
+    }
+
+    #[test]
+    fn test_get_restaurant_orders() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let customer = Address::generate(&env);
+        client.initialize(&admin);
+
+        let items = vec![&env, make_item(&env, 1, 1, 5_000_000)];
+        client.place_order(&customer, &7, &items.clone(), &String::from_str(&env, ""));
+        client.place_order(&customer, &7, &items, &String::from_str(&env, ""));
+
+        let orders = client.get_restaurant_orders(&7);
+        assert_eq!(orders.len(), 2);
+    }
+}
