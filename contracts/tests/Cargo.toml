@@ -1,14 +1,18 @@
 [package]
-name = "order"
+name = "integration-tests"
 version = "0.1.0"
 edition = "2021"
 
-[lib]
-crate-type = ["cdylib"]
+[[bin]]
+name = "integration_test"
+path = "integration_test.rs"
 
 [dependencies]
 soroban-sdk = { workspace = true }
 loyalty_token = { path = "../loyalty_token", package = "loyalty-token" }
+restaurant_registry = { path = "../restaurant_registry", package = "restaurant-registry" }
+payment = { path = "../payment" }
+order = { path = "../order" }
 
 [dev-dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
@@ -17,7 +21,7 @@ soroban-sdk = { version = "22.0.0", features = ["testutils"] }
 opt-level = "z"
 overflow-checks = true
 debug = 0
-strip = "symbols"
+strip = true
 debug-assertions = false
 panic = "abort"
 codegen-units = 1

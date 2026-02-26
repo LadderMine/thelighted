@@ -5,6 +5,7 @@ members = [
     "order",
     "payment",
     "loyalty_token",
+    "tests",
 ]
 
 [workspace.dependencies]
