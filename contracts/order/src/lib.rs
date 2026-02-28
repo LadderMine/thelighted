@@ -29,7 +29,7 @@ use soroban_sdk::{
 
 /// Lifecycle state of an order.
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum OrderStatus {
     Pending,
     Confirmed,
@@ -366,7 +366,7 @@ mod test {
     fn setup() -> (Env, OrderContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
-        let cid = env.register_contract(None, OrderContract);
+        let cid = env.register(None, OrderContract);
         let client = OrderContractClient::new(&env, &cid);
         (env, client)
     }

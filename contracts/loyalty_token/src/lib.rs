@@ -406,7 +406,7 @@ mod test {
     fn setup() -> (Env, LoyaltyTokenClient<'static>, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        let cid = env.register_contract(None, LoyaltyToken);
+        let cid = env.register(None, LoyaltyToken);
         let client = LoyaltyTokenClient::new(&env, &cid);
         let admin = Address::generate(&env);
         client.initialize(&admin, &admin); // admin is also minter
