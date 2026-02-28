@@ -246,13 +246,13 @@ impl RestaurantRegistry {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::testutils::Address as _;
     use soroban_sdk::Env;
 
     fn setup() -> (Env, RestaurantRegistryClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register_contract(None, RestaurantRegistry);
+        let contract_id = env.register(None, RestaurantRegistry);
         let client = RestaurantRegistryClient::new(&env, &contract_id);
         (env, client)
     }

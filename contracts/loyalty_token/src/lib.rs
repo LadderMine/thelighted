@@ -25,9 +25,7 @@
 
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
 
 // ---------------------------------------------------------------------------
 // Storage keys

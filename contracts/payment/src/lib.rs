@@ -32,7 +32,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Add
 
 /// Status of a payment record.
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum PaymentStatus {
     /// Funds held in escrow on this contract.
     Escrowed,
@@ -344,11 +344,14 @@ impl PaymentContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
-    use soroban_sdk::{token, Env, IntoVal};
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{token, Env};
 
     /// Helper: create a token contract and mint `amount` to `recipient`.
-    fn create_token(env: &Env, admin: &Address) -> (Address, token::StellarAssetClient<'_>) {
+    fn create_token<'a>(
+        env: &'a Env,
+        admin: &'a Address,
+    ) -> (Address, token::StellarAssetClient<'a>) {
         let token_addr = env
             .register_stellar_asset_contract_v2(admin.clone())
             .address();
@@ -365,7 +368,7 @@ mod test {
     ) {
         let env = Env::default();
         env.mock_all_auths();
-        let cid = env.register_contract(None, PaymentContract);
+        let cid = env.register(None, PaymentContract);
         let client = PaymentContractClient::new(&env, &cid);
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
