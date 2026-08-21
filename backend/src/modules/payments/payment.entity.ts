@@ -64,6 +64,12 @@ export class Payment {
   @Column({ type: 'timestamp', nullable: true })
   confirmedAt: Date | null;
 
+  // Populated when status transitions to FAILED — a typed PaymentErrorCode
+  // (see errors/payment.errors.ts), not a raw Horizon/stack-trace dump, so
+  // it's safe to surface back to the diner-facing client.
+  @Column({ type: 'varchar', length: 64, nullable: true })
+  failureReason: string | null;
+
   @CreateDateColumn()
   createdAt: Date;
 

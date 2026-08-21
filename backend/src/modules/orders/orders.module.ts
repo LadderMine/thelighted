@@ -6,11 +6,23 @@ import { Order } from './order.entity';
 import { OrdersController } from './orders.controller';
 import { OrdersGateway } from './orders.gateway';
 import { OrdersService } from './orders.service';
+import { CheckoutTokenService } from './checkout-token.service';
+import { DinerCheckoutGuard } from './guards/diner-checkout.guard';
 
 @Module({
   imports: [AuthModule, TypeOrmModule.forFeature([Order])],
   controllers: [OrdersController],
-  providers: [OrdersGateway, OrdersService],
-  exports: [OrdersGateway, OrdersService],
+  providers: [
+    OrdersGateway,
+    OrdersService,
+    CheckoutTokenService,
+    DinerCheckoutGuard,
+  ],
+  exports: [
+    OrdersGateway,
+    OrdersService,
+    CheckoutTokenService,
+    DinerCheckoutGuard,
+  ],
 })
 export class OrdersModule {}

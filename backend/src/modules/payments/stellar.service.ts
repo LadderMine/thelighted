@@ -2,6 +2,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
+  Account,
   Asset,
   Horizon,
   Memo,
@@ -20,6 +21,15 @@ export interface BuildPaymentTransactionParams {
   /** Decimal string, e.g. "12.5000000" — never a float, to avoid precision loss. */
   amount: string;
   memo?: string;
+  /**
+   * The exact sequence number this transaction should carry (i.e. what
+   * SequenceAllocator.allocate() returns), NOT the account's current
+   * on-ledger sequence. TransactionBuilder always builds a transaction
+   * whose seqNum is `source.sequenceNumber() + 1`, so callers supplying
+   * this must not also expect the usual +1 — buildPaymentTransaction
+   * compensates by constructing the Account one below this value.
+   */
+  sequenceOverride?: string;
 }
 
 /**
@@ -88,7 +98,12 @@ export class StellarService implements OnModuleInit {
   async buildPaymentTransaction(
     params: BuildPaymentTransactionParams,
   ): Promise<string> {
-    const sourceAccount = await this.server.loadAccount(params.sourceAccount);
+    const sourceAccount = params.sequenceOverride
+      ? new Account(
+          params.sourceAccount,
+          (BigInt(params.sequenceOverride) - 1n).toString(),
+        )
+      : await this.server.loadAccount(params.sourceAccount);
     const baseFee = await this.server.fetchBaseFee();
     const asset =
       params.assetCode === 'XLM'

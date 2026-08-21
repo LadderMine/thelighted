@@ -27,6 +27,9 @@ import { TokenBlacklistService } from './token-blacklist.service';
   ],
   controllers: [AuthController],
   providers: [AuthService, JwtStrategy, TokenBlacklistService],
-  exports: [AuthService],
+  // JwtModule is exported so other modules that already import AuthModule
+  // (e.g. OrdersModule, for diner checkout tokens — see ADR 0002) can reuse
+  // this same JwtService/secret instead of registering a second JwtModule.
+  exports: [AuthService, JwtModule],
 })
 export class AuthModule {}

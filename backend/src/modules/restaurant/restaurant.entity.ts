@@ -42,6 +42,13 @@ export class Restaurant {
   @Column({ type: 'boolean', default: true })
   isActive: boolean;
 
+  // Destination account for Stellar payments (see modules/payments, #313).
+  // Nullable because not every restaurant has onboarded a wallet yet —
+  // PaymentsService rejects initiation with RestaurantWalletNotConfiguredError
+  // when this is unset rather than treating it as a required column.
+  @Column({ type: 'varchar', length: 56, nullable: true })
+  stellarWalletAddress: string | null;
+
   @Column({ type: 'jsonb', nullable: true })
   settings: Record<string, any>; // Store restaurant-specific settings
 
