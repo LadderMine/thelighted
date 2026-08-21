@@ -10,31 +10,31 @@ import {
   Request,
   UseGuards,
 } from '@nestjs/common';
-import { v4 as uuid } from 'uuid';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { CreateOrderNotificationDto } from './dto/create-order-notification.dto';
 import { UpdateOrderStatusDto } from './dto/update-order-status.dto';
 import { OrdersGateway } from './orders.gateway';
+import { OrdersService } from './orders.service';
 
-// There is no persisted Orders domain yet — these endpoints are the
-// integration point real order creation/status-update flows will call into
-// once that domain lands. For now they broadcast directly over the
-// OrdersGateway so the real-time notification path can be built and tested
-// end-to-end ahead of it.
 @Controller('orders')
 @UseGuards(JwtAuthGuard)
 export class OrdersController {
-  constructor(private readonly ordersGateway: OrdersGateway) {}
+  constructor(
+    private readonly ordersGateway: OrdersGateway,
+    private readonly ordersService: OrdersService,
+  ) {}
 
   @Post()
   @HttpCode(HttpStatus.CREATED)
-  create(@Request() req, @Body() dto: CreateOrderNotificationDto) {
+  async create(@Request() req, @Body() dto: CreateOrderNotificationDto) {
+    const saved = await this.ordersService.create(req.user.restaurantId, dto);
+
     const order = {
-      orderId: uuid(),
-      orderNumber: dto.orderNumber,
-      status: dto.status ?? 'pending',
-      total: dto.total,
-      createdAt: new Date().toISOString(),
+      orderId: saved.id,
+      orderNumber: saved.orderNumber,
+      status: saved.status,
+      total: Number(saved.total),
+      createdAt: saved.createdAt.toISOString(),
     };
 
     this.ordersGateway.emitNewOrder(req.user.restaurantId, order);
@@ -44,16 +44,22 @@ export class OrdersController {
 
   @Patch(':orderId/status')
   @HttpCode(HttpStatus.OK)
-  updateStatus(
+  async updateStatus(
     @Request() req,
     @Param('orderId') orderId: string,
     @Body() dto: UpdateOrderStatusDto,
   ) {
-    const event = {
+    const saved = await this.ordersService.updateStatus(
       orderId,
-      orderNumber: dto.orderNumber ?? orderId,
-      status: dto.status,
-      updatedAt: new Date().toISOString(),
+      req.user.restaurantId,
+      dto,
+    );
+
+    const event = {
+      orderId: saved.id,
+      orderNumber: dto.orderNumber ?? saved.orderNumber,
+      status: saved.status,
+      updatedAt: saved.updatedAt.toISOString(),
     };
 
     this.ordersGateway.emitOrderStatusChanged(req.user.restaurantId, event);

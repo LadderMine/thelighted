@@ -1,9 +1,10 @@
 // backend/src/modules/orders/dto/update-order-status.dto.ts
-import { IsOptional, IsString } from 'class-validator';
+import { IsEnum, IsOptional, IsString } from 'class-validator';
+import { OrderStatus } from '../order.entity';
 
 export class UpdateOrderStatusDto {
-  @IsString()
-  status: string;
+  @IsEnum(OrderStatus)
+  status: OrderStatus;
 
   @IsString()
   @IsOptional()

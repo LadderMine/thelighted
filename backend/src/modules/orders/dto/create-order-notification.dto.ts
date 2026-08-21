@@ -1,5 +1,6 @@
 // backend/src/modules/orders/dto/create-order-notification.dto.ts
-import { IsNumber, IsString, IsOptional, Min } from 'class-validator';
+import { IsEnum, IsNumber, IsString, IsOptional, Min } from 'class-validator';
+import { OrderStatus } from '../order.entity';
 
 export class CreateOrderNotificationDto {
   @IsString()
@@ -9,7 +10,7 @@ export class CreateOrderNotificationDto {
   @Min(0)
   total: number;
 
-  @IsString()
+  @IsEnum(OrderStatus)
   @IsOptional()
-  status?: string;
+  status?: OrderStatus;
 }

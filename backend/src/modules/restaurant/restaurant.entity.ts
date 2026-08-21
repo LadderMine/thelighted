@@ -14,6 +14,7 @@ import { ContactSubmission } from '../contact/contact-submission.entity';
 import { GalleryImage } from '../gallery/gallery-image.entity';
 import { InstagramPost } from '../instagram/instagram-post.entity';
 import { AuditLog } from '../admin/audit-log.entity';
+import { Order } from '../orders/order.entity';
 
 @Entity('restaurants')
 export class Restaurant {
@@ -64,6 +65,9 @@ export class Restaurant {
 
   @OneToMany(() => AuditLog, (item) => item.restaurant)
   auditLogs: AuditLog[];
+
+  @OneToMany(() => Order, (order) => order.restaurant)
+  orders: Order[];
 
   @CreateDateColumn()
   createdAt: Date;
