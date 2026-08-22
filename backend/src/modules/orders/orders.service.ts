@@ -34,6 +34,18 @@ export class OrdersService {
     return this.orderRepository.save(order);
   }
 
+  async findOne(orderId: string, restaurantId: string): Promise<Order> {
+    const order = await this.orderRepository.findOne({
+      where: { id: orderId, restaurantId },
+    });
+
+    if (!order) {
+      throw new NotFoundException(`Order ${orderId} not found`);
+    }
+
+    return order;
+  }
+
   async updateStatus(
     orderId: string,
     restaurantId: string,
