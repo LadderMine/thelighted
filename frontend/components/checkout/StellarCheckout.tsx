@@ -1,8 +1,24 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
+import {
+  buildTrustlineTransaction,
+  CheckoutApiError,
+  fetchPaymentStatus,
+  fetchTrustlines,
+  initiatePayment,
+  submitSignedPayment,
+  submitTrustlineTransaction,
+} from "@/lib/api/checkoutClient";
+import {
+  connectWallet,
+  disconnectWallet,
+  signTransactionXdr,
+  WalletError,
+} from "@/lib/stellar/wallet";
+import type { PaymentErrorCode, PaymentStatus } from "@/lib/types/payments";
 
-export type StellarAsset = "XLM" | "USDC" | "BITE";
+export type SettlementAsset = "XLM" | "USDC";
 
 export interface CartItem {
   id: string;
@@ -12,72 +28,320 @@ export interface CartItem {
 }
 
 interface StellarCheckoutProps {
+  orderId: string;
+  // Short-lived, order-scoped token from the QR-encoded checkout URL
+  // (ADR 0002) — this, not a staff session, is what authorizes these calls.
+  checkoutToken: string;
   items: CartItem[];
-  onSuccess?: (txHash: string) => void;
+  // The order's total and settlement asset are decided when the order is
+  // created (see backend/src/modules/orders/order.entity.ts) — not a free
+  // choice made here. Offering an asset dropdown, as the old mock did,
+  // would let a diner "pay" in an asset the order was never priced in.
+  total: number;
+  asset: SettlementAsset;
+  onSuccess?: (result: { paymentId: string; stellarTxHash: string }) => void;
   onCancel?: () => void;
 }
 
-const ASSET_DECIMALS: Record<StellarAsset, number> = {
-  XLM: 7,
-  USDC: 7,
-  BITE: 7,
-};
+type Phase =
+  | "connect"
+  | "checking-trustline"
+  | "needs-trustline"
+  | "setting-up-trustline"
+  | "ready"
+  | "paying"
+  | "confirming"
+  | "success"
+  | "error";
 
-function formatAssetAmount(amount: number, asset: StellarAsset): string {
-  return amount.toFixed(ASSET_DECIMALS[asset]);
+interface CheckoutError {
+  message: string;
+  retryable: boolean;
 }
 
-function calcTotal(items: CartItem[]): number {
-  return items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+// Kept out of the backend's asset allowlist (only USDC needs a trustline —
+// see backend dto/build-trustline.dto.ts) and undocumented on the network
+// side, so unlike XLM/USDC an issuer address can't be safely hardcoded here.
+// Without it configured, USDC checkout is disabled rather than guessed at.
+const USDC_ASSET_ISSUER = process.env.NEXT_PUBLIC_USDC_ASSET_ISSUER;
+
+// Mirrors StellarService.TRANSACTION_TIMEOUT_SECONDS — once a submitted
+// transaction's timebounds pass without independent confirmation, the
+// backend's reconciliation job marks it EXPIRED; polling past that point
+// would just wait for a status that's already decided.
+const STATUS_POLL_INTERVAL_MS = 3000;
+const STATUS_POLL_TIMEOUT_MS = 180_000;
+
+const STELLAR_EXPERT_NETWORK_SEGMENT =
+  (process.env.NEXT_PUBLIC_STELLAR_NETWORK ?? "testnet").toLowerCase() ===
+  "public"
+    ? "public"
+    : "testnet";
+
+function formatAssetAmount(amount: number): string {
+  return amount.toFixed(7);
+}
+
+function describeError(error: unknown): CheckoutError {
+  if (error instanceof WalletError) {
+    if (error.kind === "wallet_rejected") {
+      return {
+        message: "You declined the request in your wallet.",
+        retryable: true,
+      };
+    }
+    return { message: `Wallet error: ${error.message}`, retryable: true };
+  }
+
+  if (error instanceof CheckoutApiError) {
+    return {
+      message: describePaymentErrorCode(
+        error.code as PaymentErrorCode | undefined,
+        error.message
+      ),
+      retryable: error.code !== "RESTAURANT_WALLET_NOT_CONFIGURED",
+    };
+  }
+
+  return {
+    message: error instanceof Error ? error.message : "Something went wrong.",
+    retryable: true,
+  };
+}
+
+function describePaymentErrorCode(
+  code: PaymentErrorCode | undefined,
+  fallback: string
+): string {
+  switch (code) {
+    case "INSUFFICIENT_BALANCE":
+      return "Your wallet doesn't have enough balance to cover this payment.";
+    case "MISSING_TRUSTLINE":
+      return "Your wallet is missing a trustline for this asset.";
+    case "SEQUENCE_CONFLICT":
+      return "This payment attempt expired — please try again.";
+    case "RESTAURANT_WALLET_NOT_CONFIGURED":
+      return "This restaurant hasn't set up a payout wallet yet. Please tell staff.";
+    case "IDEMPOTENCY_CONFLICT":
+      return "This checkout session is out of sync — please refresh and try again.";
+    case "MALFORMED_REQUEST":
+      return "This payment request was invalid. Please refresh and try again.";
+    default:
+      return fallback || "The network rejected this payment.";
+  }
+}
+
+function describeTerminalStatus(
+  status: PaymentStatus,
+  failureReason: PaymentErrorCode | null
+): CheckoutError {
+  if (status === "expired") {
+    return {
+      message:
+        "This payment expired before it could be confirmed. Please try again.",
+      retryable: true,
+    };
+  }
+  return {
+    message: describePaymentErrorCode(failureReason ?? undefined, "This payment failed."),
+    retryable: true,
+  };
 }
 
 export default function StellarCheckout({
+  orderId,
+  checkoutToken,
   items,
+  total,
+  asset,
   onSuccess,
   onCancel,
 }: StellarCheckoutProps) {
-  const [asset, setAsset] = useState<StellarAsset>("XLM");
-  const [walletAddress, setWalletAddress] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [step, setStep] = useState<"review" | "confirm" | "done">("review");
+  const [phase, setPhase] = useState<Phase>("connect");
+  const [walletAddress, setWalletAddress] = useState<string | null>(null);
+  const [error, setError] = useState<CheckoutError | null>(null);
   const [txHash, setTxHash] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
-  const total = calcTotal(items);
+  const idempotencyKeyRef = useRef<string | null>(null);
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  async function handleConfirm() {
-    setError(null);
+  useEffect(() => {
+    return () => {
+      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+      void disconnectWallet();
+    };
+  }, []);
 
-    if (!walletAddress.trim()) {
-      setError("Please enter your Stellar wallet address.");
-      return;
-    }
-
-    if (!/^G[A-Z2-7]{55}$/.test(walletAddress.trim())) {
-      setError("Invalid Stellar address. Must start with G and be 56 chars.");
-      return;
-    }
-
-    setLoading(true);
-    try {
-      // In production this calls your backend /payments/stellar/initiate
-      // which builds and submits the transaction via Horizon.
-      await new Promise((res) => setTimeout(res, 1200));
-      const mockHash =
-        "TX" + Math.random().toString(36).substring(2, 18).toUpperCase();
-      setTxHash(mockHash);
-      setStep("done");
-      onSuccess?.(mockHash);
-    } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : "Payment failed. Please retry."
-      );
-    } finally {
-      setLoading(false);
+  function stopPolling(): void {
+    if (pollTimerRef.current) {
+      clearInterval(pollTimerRef.current);
+      pollTimerRef.current = null;
     }
   }
 
-  if (step === "done" && txHash) {
+  async function checkTrustline(address: string): Promise<void> {
+    if (!USDC_ASSET_ISSUER) {
+      setError({
+        message: "USDC payments aren't configured for this restaurant yet.",
+        retryable: false,
+      });
+      setPhase("error");
+      return;
+    }
+    try {
+      const trustlines = await fetchTrustlines(checkoutToken, address);
+      if (!trustlines.funded) {
+        setError({
+          message:
+            "This wallet has no funded Stellar account yet. Fund it with a small amount of XLM, then reconnect.",
+          retryable: false,
+        });
+        setPhase("error");
+        return;
+      }
+      const hasTrustline = trustlines.balances.some(
+        (b) => b.assetCode === "USDC" && b.assetIssuer === USDC_ASSET_ISSUER
+      );
+      setPhase(hasTrustline ? "ready" : "needs-trustline");
+    } catch (err) {
+      setError(describeError(err));
+      setPhase("error");
+    }
+  }
+
+  async function handleConnect(): Promise<void> {
+    setError(null);
+    setBusy(true);
+    try {
+      const { address } = await connectWallet();
+      setWalletAddress(address);
+      // A new wallet is a new payment attempt — the old idempotency key (if
+      // any) belonged to a payment sourced from a different account.
+      idempotencyKeyRef.current = null;
+      if (asset === "USDC") {
+        setPhase("checking-trustline");
+        await checkTrustline(address);
+      } else {
+        setPhase("ready");
+      }
+    } catch (err) {
+      setError(describeError(err));
+      setPhase("error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSetupTrustline(): Promise<void> {
+    if (!walletAddress || !USDC_ASSET_ISSUER) return;
+    setError(null);
+    setBusy(true);
+    setPhase("setting-up-trustline");
+    try {
+      const built = await buildTrustlineTransaction(checkoutToken, {
+        sourceAccount: walletAddress,
+        assetCode: "USDC",
+        assetIssuer: USDC_ASSET_ISSUER,
+      });
+      const signed = await signTransactionXdr(
+        built.unsignedTransactionXdr,
+        walletAddress
+      );
+      await submitTrustlineTransaction(checkoutToken, signed);
+      setPhase("ready");
+    } catch (err) {
+      setError(describeError(err));
+      setPhase("needs-trustline");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function startPolling(paymentId: string): void {
+    const startedAt = Date.now();
+    pollTimerRef.current = setInterval(() => {
+      void (async () => {
+        if (Date.now() - startedAt > STATUS_POLL_TIMEOUT_MS) {
+          stopPolling();
+          setError({
+            message:
+              "We couldn't confirm this payment in time. Check your wallet — it may still complete on-chain.",
+            retryable: false,
+          });
+          setPhase("error");
+          return;
+        }
+        try {
+          const record = await fetchPaymentStatus(checkoutToken, paymentId);
+          if (record.status === "confirmed") {
+            stopPolling();
+            setTxHash(record.stellarTxHash);
+            setPhase("success");
+            if (record.stellarTxHash) {
+              onSuccess?.({ paymentId, stellarTxHash: record.stellarTxHash });
+            }
+          } else if (record.status === "failed" || record.status === "expired") {
+            stopPolling();
+            setError(describeTerminalStatus(record.status, record.failureReason));
+            setPhase("error");
+          }
+          // pending/submitted: still confirming, keep polling.
+        } catch {
+          // A transient poll failure isn't fatal on its own — retry until
+          // STATUS_POLL_TIMEOUT_MS gives up for good.
+        }
+      })();
+    }, STATUS_POLL_INTERVAL_MS);
+  }
+
+  async function handlePay(): Promise<void> {
+    if (!walletAddress) return;
+    setError(null);
+    setBusy(true);
+    setPhase("paying");
+    if (!idempotencyKeyRef.current) {
+      idempotencyKeyRef.current = crypto.randomUUID();
+    }
+    try {
+      const initiated = await initiatePayment(checkoutToken, {
+        orderId,
+        sourceAccount: walletAddress,
+        assetCode: asset,
+        assetIssuer: asset === "USDC" ? USDC_ASSET_ISSUER : undefined,
+        amount: formatAssetAmount(total),
+        idempotencyKey: idempotencyKeyRef.current,
+      });
+
+      const signed = await signTransactionXdr(
+        initiated.unsignedTransactionXdr,
+        walletAddress
+      );
+
+      await submitSignedPayment(checkoutToken, initiated.paymentId, signed);
+      setPhase("confirming");
+      startPolling(initiated.paymentId);
+    } catch (err) {
+      setError(describeError(err));
+      setPhase("ready");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function handleRetry(): void {
+    setError(null);
+    if (!walletAddress) {
+      setPhase("connect");
+    } else if (asset === "USDC") {
+      setPhase("checking-trustline");
+      void checkTrustline(walletAddress);
+    } else {
+      setPhase("ready");
+    }
+  }
+
+  if (phase === "success" && txHash) {
     return (
       <div className="flex flex-col items-center gap-4 rounded-2xl border border-green-200 bg-green-50 p-8">
         <div className="text-4xl">✅</div>
@@ -85,13 +349,13 @@ export default function StellarCheckout({
           Payment Successful
         </h2>
         <p className="text-sm text-green-700">
-          {formatAssetAmount(total, asset)} {asset} sent
+          {formatAssetAmount(total)} {asset} sent
         </p>
         <p className="break-all rounded bg-green-100 p-2 font-mono text-xs text-green-900">
           {txHash}
         </p>
         <a
-          href={`https://stellar.expert/explorer/public/tx/${txHash}`}
+          href={`https://stellar.expert/explorer/${STELLAR_EXPERT_NETWORK_SEGMENT}/tx/${txHash}`}
           target="_blank"
           rel="noopener noreferrer"
           className="text-sm text-blue-600 underline"
@@ -104,11 +368,8 @@ export default function StellarCheckout({
 
   return (
     <div className="flex flex-col gap-6 rounded-2xl border border-gray-200 bg-white p-6 shadow-sm">
-      <h2 className="text-lg font-semibold text-gray-900">
-        Stellar Checkout
-      </h2>
+      <h2 className="text-lg font-semibold text-gray-900">Stellar Checkout</h2>
 
-      {/* Order summary */}
       <div className="flex flex-col gap-2">
         <h3 className="text-sm font-medium text-gray-600">Order Summary</h3>
         <ul className="divide-y divide-gray-100 rounded-lg border border-gray-100">
@@ -126,77 +387,112 @@ export default function StellarCheckout({
         </ul>
         <div className="flex justify-between px-4 py-2 text-sm font-semibold text-gray-900">
           <span>Total</span>
-          <span>${total.toFixed(2)}</span>
+          <span>
+            {formatAssetAmount(total)} {asset}
+          </span>
         </div>
       </div>
 
-      {/* Asset selector */}
-      <div className="flex flex-col gap-1">
-        <label
-          htmlFor="asset-select"
-          className="text-sm font-medium text-gray-700"
-        >
-          Pay with
-        </label>
-        <select
-          id="asset-select"
-          value={asset}
-          onChange={(e) => setAsset(e.target.value as StellarAsset)}
-          className="rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-        >
-          <option value="XLM">XLM — Stellar Lumens</option>
-          <option value="USDC">USDC — USD Coin (Stellar)</option>
-          <option value="BITE">BITE — Loyalty Token</option>
-        </select>
-        <p className="text-xs text-gray-500">
-          Amount due: {formatAssetAmount(total, asset)} {asset}
-        </p>
-      </div>
+      {phase === "connect" && (
+        <div className="flex flex-col gap-2 rounded-lg border border-gray-100 bg-gray-50 p-4">
+          <p className="text-sm text-gray-600">
+            Connect a Stellar wallet to pay. On a phone, use a wallet with its
+            own in-app browser (e.g. LOBSTR) or Albedo — Freighter is a
+            desktop browser extension only.
+          </p>
+          <button
+            type="button"
+            onClick={() => void handleConnect()}
+            disabled={busy}
+            className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+          >
+            {busy ? "Connecting…" : "Connect Wallet"}
+          </button>
+        </div>
+      )}
 
-      {/* Wallet address */}
-      <div className="flex flex-col gap-1">
-        <label
-          htmlFor="wallet-address"
-          className="text-sm font-medium text-gray-700"
-        >
-          Your Stellar Wallet Address
-        </label>
-        <input
-          id="wallet-address"
-          type="text"
-          value={walletAddress}
-          onChange={(e) => setWalletAddress(e.target.value)}
-          placeholder="GABC...XYZ"
-          className="rounded-lg border border-gray-300 px-3 py-2 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-          aria-describedby="wallet-hint"
-        />
-        <p id="wallet-hint" className="text-xs text-gray-500">
-          Must be a valid Stellar public key (starts with G, 56 characters).
+      {phase === "checking-trustline" && (
+        <p className="text-sm text-gray-500">Checking your wallet…</p>
+      )}
+
+      {walletAddress && phase !== "connect" && phase !== "checking-trustline" && (
+        <p className="break-all rounded-lg bg-gray-50 p-2 font-mono text-xs text-gray-500">
+          Connected: {walletAddress}
         </p>
-      </div>
+      )}
+
+      {phase === "needs-trustline" && (
+        <div className="flex flex-col gap-2 rounded-lg border border-amber-200 bg-amber-50 p-4">
+          <p className="text-sm text-amber-800">
+            Your wallet doesn&apos;t trust USDC yet. This is a one-time setup
+            transaction — you&apos;ll be asked to sign it, then you can pay.
+          </p>
+          <button
+            type="button"
+            onClick={() => void handleSetupTrustline()}
+            disabled={busy}
+            className="rounded-lg bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-50"
+          >
+            Set Up USDC Trustline
+          </button>
+        </div>
+      )}
+
+      {phase === "setting-up-trustline" && (
+        <p className="text-sm text-gray-500">
+          Waiting for your wallet to sign the trustline transaction…
+        </p>
+      )}
+
+      {phase === "paying" && (
+        <p className="text-sm text-gray-500">
+          Waiting for your wallet to sign the payment…
+        </p>
+      )}
+
+      {phase === "confirming" && (
+        <p className="text-sm text-gray-500">
+          Confirming your payment on the Stellar network…
+        </p>
+      )}
 
       {error && (
-        <p role="alert" className="rounded-lg bg-red-50 p-3 text-sm text-red-700">
-          {error}
-        </p>
+        <div role="alert" className="flex flex-col gap-2 rounded-lg bg-red-50 p-3">
+          <p className="text-sm text-red-700">{error.message}</p>
+          {/* Other phases (ready, needs-trustline) already show their own
+              actionable button below — this generic retry only applies when
+              "error" left no other button on screen. */}
+          {phase === "error" && error.retryable && (
+            <button
+              type="button"
+              onClick={handleRetry}
+              className="self-start text-sm font-medium text-red-700 underline"
+            >
+              Try again
+            </button>
+          )}
+        </div>
       )}
 
       <div className="flex gap-3">
         <button
           type="button"
           onClick={onCancel}
-          className="flex-1 rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+          disabled={phase === "paying" || phase === "confirming" || phase === "setting-up-trustline"}
+          className="flex-1 rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
         >
           Cancel
         </button>
-        <button
-          type="button"
-          onClick={handleConfirm}
-          disabled={loading}
-          className="flex-1 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
-        >
-          {loading ? "Processing…" : `Pay ${formatAssetAmount(total, asset)} ${asset}`}
-        </button>
+        {phase === "ready" && (
+          <button
+            type="button"
+            onClick={() => void handlePay()}
+            disabled={busy}
+            className="flex-1 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+          >
+            {busy ? "Processing…" : `Pay ${formatAssetAmount(total)} ${asset}`}
+          </button>
+        )}
       </div>
     </div>
   );

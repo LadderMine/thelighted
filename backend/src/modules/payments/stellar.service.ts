@@ -7,6 +7,7 @@ import {
   Horizon,
   Memo,
   Networks,
+  NotFoundError,
   Operation,
   TransactionBuilder,
 } from '@stellar/stellar-sdk';
@@ -30,6 +31,30 @@ export interface BuildPaymentTransactionParams {
    * compensates by constructing the Account one below this value.
    */
   sequenceOverride?: string;
+}
+
+export interface BuildTrustlineTransactionParams {
+  sourceAccount: string;
+  assetCode: string;
+  assetIssuer: string;
+}
+
+export interface TrustlineBalance {
+  /** 'XLM' for the native balance, otherwise the asset code (e.g. 'USDC'). */
+  assetCode: string;
+  /** null for the native balance — Asset.native() has no issuer. */
+  assetIssuer: string | null;
+  balance: string;
+}
+
+export interface AccountTrustlines {
+  /**
+   * false when the account doesn't exist on the network yet (issue #315
+   * edge case: a brand-new address with zero XLM can't hold a trustline —
+   * or anything — until it's funded with the minimum reserve).
+   */
+  funded: boolean;
+  balances: TrustlineBalance[];
 }
 
 // Shared between the transaction builder's own timeout and the Payment's
@@ -170,5 +195,61 @@ export class StellarService implements OnModuleInit {
     hash: string,
   ): Promise<Horizon.ServerApi.TransactionRecord> {
     return this.server.transactions().transaction(hash).call();
+  }
+
+  /**
+   * Reports which assets `publicKey` already trusts, so #315's checkout UI
+   * can offer a trustline-setup step before a payment attempt fails with
+   * `op_no_trust` (see errors/horizon-error-mapper.ts). A NotFoundError here
+   * means the account has never been created/funded on this network at
+   * all — distinct from "funded but missing this one trustline" — so
+   * callers can show the right guidance for each case.
+   */
+  async getAccountTrustlines(publicKey: string): Promise<AccountTrustlines> {
+    try {
+      const account = await this.server.loadAccount(publicKey);
+      const balances: TrustlineBalance[] = account.balances.map((entry) => {
+        if (entry.asset_type === 'native') {
+          return { assetCode: 'XLM', assetIssuer: null, balance: entry.balance };
+        }
+        const trustline = entry as Horizon.HorizonApi.BalanceLineAsset;
+        return {
+          assetCode: trustline.asset_code,
+          assetIssuer: trustline.asset_issuer,
+          balance: trustline.balance,
+        };
+      });
+      return { funded: true, balances };
+    } catch (error) {
+      if (error instanceof NotFoundError) {
+        return { funded: false, balances: [] };
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Builds an unsigned `changeTrust` transaction so a diner's wallet can
+   * establish a trustline before paying in a non-native asset (issue #315).
+   * Always loads the account fresh (no sequence override): unlike payments,
+   * trustline setup isn't behind SequenceAllocator — it's a one-off step the
+   * diner takes sequentially, not a contended, idempotency-tracked resource.
+   */
+  async buildTrustlineTransaction(
+    params: BuildTrustlineTransactionParams,
+  ): Promise<string> {
+    const sourceAccount = await this.server.loadAccount(params.sourceAccount);
+    const baseFee = await this.server.fetchBaseFee();
+    const asset = new Asset(params.assetCode, params.assetIssuer);
+
+    const transaction = new TransactionBuilder(sourceAccount, {
+      fee: String(baseFee),
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(Operation.changeTrust({ asset }))
+      .setTimeout(TRANSACTION_TIMEOUT_SECONDS)
+      .build();
+
+    return transaction.toXDR();
   }
 }

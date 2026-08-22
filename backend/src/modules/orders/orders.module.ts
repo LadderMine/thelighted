@@ -3,6 +3,7 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from '../auth/auth.module';
 import { Order } from './order.entity';
+import { DinerOrdersController } from './diner-orders.controller';
 import { OrdersController } from './orders.controller';
 import { OrdersGateway } from './orders.gateway';
 import { OrdersService } from './orders.service';
@@ -11,7 +12,7 @@ import { DinerCheckoutGuard } from './guards/diner-checkout.guard';
 
 @Module({
   imports: [AuthModule, TypeOrmModule.forFeature([Order])],
-  controllers: [OrdersController],
+  controllers: [OrdersController, DinerOrdersController],
   providers: [
     OrdersGateway,
     OrdersService,

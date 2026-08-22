@@ -9,15 +9,19 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
+import { StrKey } from '@stellar/stellar-sdk';
 import { Public } from '../../common/decorators/public.decorator';
 import {
   DinerCheckoutGuard,
   CheckoutRequest,
 } from '../orders/guards/diner-checkout.guard';
+import { BuildTrustlineDto } from './dto/build-trustline.dto';
 import { InitiatePaymentDto } from './dto/initiate-payment.dto';
 import { SubmitSignedPaymentDto } from './dto/submit-signed-payment.dto';
 import { PaymentsService } from './payments.service';
+import { StellarService } from './stellar.service';
 import { MalformedPaymentRequestError } from './errors/payment.errors';
+import { mapHorizonSubmissionError } from './errors/horizon-error-mapper';
 
 // Diner-facing, not staff-facing (see ADR 0002) — @Public() bypasses the
 // global staff JwtAuthGuard, and DinerCheckoutGuard is the real gate here.
@@ -25,7 +29,10 @@ import { MalformedPaymentRequestError } from './errors/payment.errors';
 @Public()
 @UseGuards(DinerCheckoutGuard)
 export class PaymentsController {
-  constructor(private readonly paymentsService: PaymentsService) {}
+  constructor(
+    private readonly paymentsService: PaymentsService,
+    private readonly stellarService: StellarService,
+  ) {}
 
   // Throttled tighter than the app default — a diner initiates a payment
   // once per checkout, not in a tight loop; this bounds abuse of an
@@ -64,6 +71,53 @@ export class PaymentsController {
     @Param('paymentId') paymentId: string,
   ) {
     return this.paymentsService.findOne(paymentId, req.checkoutContext.orderId);
+  }
+
+  // Lets the checkout UI decide, before building a payment, whether the
+  // diner's connected wallet needs a trustline-setup step first (issue
+  // #315) instead of letting a non-native payment fail opaquely on
+  // `op_no_trust`.
+  @Get('account/:publicKey/trustlines')
+  async getTrustlines(@Param('publicKey') publicKey: string) {
+    this.assertValidPublicKey(publicKey);
+    return this.stellarService.getAccountTrustlines(publicKey);
+  }
+
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  @Post('account/trustline')
+  async buildTrustline(@Body() dto: BuildTrustlineDto) {
+    this.assertValidPublicKey(dto.sourceAccount);
+    this.assertValidPublicKey(dto.assetIssuer);
+    const unsignedTransactionXdr =
+      await this.stellarService.buildTrustlineTransaction(dto);
+    return { unsignedTransactionXdr };
+  }
+
+  // Trustline setup isn't a Payment (no restaurant destination, no
+  // idempotency key, no PaymentStatus lifecycle) — the Payment entity
+  // models a specific settlement to a specific restaurant, not every
+  // transaction a diner's wallet might submit. Submitting it here, straight
+  // through StellarService, keeps that model from being stretched to cover
+  // a step that isn't actually a payment.
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  @Post('account/trustline/submit')
+  async submitTrustline(@Body() dto: SubmitSignedPaymentDto) {
+    try {
+      const result = await this.stellarService.submitTransaction(
+        dto.signedTransactionXdr,
+      );
+      return { successful: result.successful, hash: result.hash };
+    } catch (error) {
+      throw mapHorizonSubmissionError(error);
+    }
+  }
+
+  private assertValidPublicKey(publicKey: string): void {
+    if (!StrKey.isValidEd25519PublicKey(publicKey)) {
+      throw new MalformedPaymentRequestError({
+        reason: 'not a valid Stellar public key',
+      });
+    }
   }
 
   // A valid checkout token only ever authorizes the order it was issued
