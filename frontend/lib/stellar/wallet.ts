@@ -1,10 +1,10 @@
-import {
-  AlbedoModule,
-  FreighterModule,
-  LobstrModule,
-  Networks,
-  StellarWalletsKit,
-} from "@creit.tech/stellar-wallets-kit";
+import { Networks, StellarWalletsKit } from "@creit.tech/stellar-wallets-kit";
+// Each wallet module is its own subpath export (see the package's "exports"
+// map) — the root package only re-exports the kit itself, not every wallet
+// module, so importing these from the bare package name fails to resolve.
+import { AlbedoModule } from "@creit.tech/stellar-wallets-kit/modules/albedo";
+import { FreighterModule } from "@creit.tech/stellar-wallets-kit/modules/freighter";
+import { LobstrModule } from "@creit.tech/stellar-wallets-kit/modules/lobstr";
 
 /**
  * Only the three wallets the issue asks for (Freighter/Albedo/LOBSTR) —
