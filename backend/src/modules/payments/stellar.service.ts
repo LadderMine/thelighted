@@ -32,6 +32,10 @@ export interface BuildPaymentTransactionParams {
   sequenceOverride?: string;
 }
 
+// Shared between the transaction builder's own timeout and the Payment's
+// expiresAt bookkeeping (issue #314) so the two never drift apart.
+export const TRANSACTION_TIMEOUT_SECONDS = 180;
+
 /**
  * Thin, testable wrapper around @stellar/stellar-sdk's Horizon.Server.
  * No business logic lives here (idempotency, persistence, retry policy) —
@@ -122,7 +126,7 @@ export class StellarService implements OnModuleInit {
         }),
       )
       .addMemo(params.memo ? Memo.text(params.memo) : Memo.none())
-      .setTimeout(180)
+      .setTimeout(TRANSACTION_TIMEOUT_SECONDS)
       .build();
 
     return transaction.toXDR();
@@ -137,5 +141,34 @@ export class StellarService implements OnModuleInit {
       this.networkPassphrase,
     );
     return this.server.submitTransaction(transaction);
+  }
+
+  /**
+   * Computes a transaction's hash locally from its (signed or unsigned)
+   * XDR — deterministic, no network call. Used to record a Payment's
+   * `stellarTxHash` BEFORE attempting submission (issue #314): if the
+   * submit call itself errors ambiguously (timeout, dropped connection),
+   * we still know which hash to independently verify later, rather than
+   * having no way to look the transaction up at all.
+   */
+  computeTransactionHash(transactionXdr: string): string {
+    const transaction = TransactionBuilder.fromXDR(
+      transactionXdr,
+      this.networkPassphrase,
+    );
+    return transaction.hash().toString('hex');
+  }
+
+  /**
+   * Independently verifies a transaction against Horizon by hash — the
+   * only thing allowed to justify a CONFIRMED status (issue #314). Throws
+   * NotFoundError (re-exported by the caller's check) when the ledger has
+   * no record of it yet, which is expected for a few seconds after
+   * submission (propagation delay), not necessarily a failure.
+   */
+  async fetchTransaction(
+    hash: string,
+  ): Promise<Horizon.ServerApi.TransactionRecord> {
+    return this.server.transactions().transaction(hash).call();
   }
 }

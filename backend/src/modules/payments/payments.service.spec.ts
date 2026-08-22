@@ -35,11 +35,20 @@ describe('PaymentsService', () => {
   let paymentRepository: MockRepository;
   let orderRepository: MockRepository;
   let restaurantRepository: MockRepository;
-  let stellarService: { buildPaymentTransaction: jest.Mock; submitTransaction: jest.Mock };
+  let stellarService: {
+    buildPaymentTransaction: jest.Mock;
+    submitTransaction: jest.Mock;
+    computeTransactionHash: jest.Mock;
+  };
   let sequenceAllocator: { allocate: jest.Mock; invalidate: jest.Mock };
+  let paymentsGateway: { emitPaymentStatusChanged: jest.Mock };
   let service: PaymentsService;
 
-  const order = { id: 'order-1', restaurantId: 'restaurant-1', orderNumber: 'ORD-1' };
+  const order = {
+    id: 'order-1',
+    restaurantId: 'restaurant-1',
+    orderNumber: 'ORD-1',
+  };
   const restaurant = { id: 'restaurant-1', stellarWalletAddress: 'GDEST...' };
 
   const baseDto = {
@@ -57,11 +66,15 @@ describe('PaymentsService', () => {
     stellarService = {
       buildPaymentTransaction: jest.fn().mockResolvedValue('unsigned-xdr'),
       submitTransaction: jest.fn(),
+      computeTransactionHash: jest
+        .fn()
+        .mockReturnValue('locally-computed-hash'),
     };
     sequenceAllocator = {
       allocate: jest.fn().mockResolvedValue('101'),
       invalidate: jest.fn(),
     };
+    paymentsGateway = { emitPaymentStatusChanged: jest.fn() };
 
     service = new PaymentsService(
       paymentRepository as any,
@@ -69,6 +82,7 @@ describe('PaymentsService', () => {
       restaurantRepository as any,
       stellarService as any,
       sequenceAllocator as any,
+      paymentsGateway as any,
     );
 
     paymentRepository.findOne.mockResolvedValue(null);
@@ -180,7 +194,7 @@ describe('PaymentsService', () => {
   });
 
   describe('submitSigned', () => {
-    it('submits to Horizon and marks the payment confirmed', async () => {
+    it('submits to Horizon and marks the payment SUBMITTED, never CONFIRMED directly', async () => {
       paymentRepository.findOne.mockResolvedValueOnce({
         id: 'payment-1',
         orderId: 'order-1',
@@ -198,15 +212,86 @@ describe('PaymentsService', () => {
 
       expect(result).toEqual({
         paymentId: 'payment-1',
-        status: PaymentStatus.CONFIRMED,
-        stellarTxHash: 'tx-hash-1',
+        status: PaymentStatus.SUBMITTED,
+        stellarTxHash: 'locally-computed-hash',
       });
       expect(paymentRepository.save).toHaveBeenCalledWith(
         expect.objectContaining({
-          status: PaymentStatus.CONFIRMED,
-          stellarTxHash: 'tx-hash-1',
+          status: PaymentStatus.SUBMITTED,
+          stellarTxHash: 'locally-computed-hash',
         }),
       );
+      expect(paymentsGateway.emitPaymentStatusChanged).toHaveBeenCalledWith(
+        'restaurant-1',
+        expect.objectContaining({
+          paymentId: 'payment-1',
+          status: PaymentStatus.SUBMITTED,
+        }),
+      );
+    });
+
+    it('computes and persists the hash locally BEFORE calling Horizon', async () => {
+      paymentRepository.findOne.mockResolvedValueOnce({
+        id: 'payment-1',
+        orderId: 'order-1',
+        sourceAccount: 'GSOURCE...',
+        status: PaymentStatus.PENDING,
+      });
+      stellarService.submitTransaction.mockResolvedValueOnce({
+        hash: 'tx-hash-1',
+        successful: true,
+      });
+
+      await service.submitSigned('payment-1', 'order-1', {
+        signedTransactionXdr: 'signed-xdr',
+      });
+
+      expect(stellarService.computeTransactionHash).toHaveBeenCalledWith(
+        'signed-xdr',
+      );
+    });
+
+    it('leaves the payment SUBMITTED on an ambiguous (network/timeout) submit error, without throwing', async () => {
+      paymentRepository.findOne.mockResolvedValueOnce({
+        id: 'payment-1',
+        orderId: 'order-1',
+        sourceAccount: 'GSOURCE...',
+        status: PaymentStatus.PENDING,
+      });
+      stellarService.submitTransaction.mockRejectedValueOnce(
+        new Error('socket hang up'),
+      );
+
+      const result = await service.submitSigned('payment-1', 'order-1', {
+        signedTransactionXdr: 'signed-xdr',
+      });
+
+      expect(result).toEqual({
+        paymentId: 'payment-1',
+        status: PaymentStatus.SUBMITTED,
+        stellarTxHash: 'locally-computed-hash',
+      });
+      // Only ever saved once — the initial PENDING -> SUBMITTED transition.
+      // An ambiguous error must not also flip it to FAILED.
+      expect(paymentRepository.save).toHaveBeenCalledTimes(1);
+    });
+
+    it('is a no-op replay for an already-submitted payment', async () => {
+      paymentRepository.findOne.mockResolvedValueOnce({
+        id: 'payment-1',
+        orderId: 'order-1',
+        sourceAccount: 'GSOURCE...',
+        status: PaymentStatus.SUBMITTED,
+        stellarTxHash: 'tx-hash-1',
+      });
+
+      const result = await service.submitSigned('payment-1', 'order-1', {
+        signedTransactionXdr: 'signed-xdr',
+      });
+
+      expect(result.status).toBe(PaymentStatus.SUBMITTED);
+      expect(stellarService.submitTransaction).not.toHaveBeenCalled();
+      expect(paymentRepository.save).not.toHaveBeenCalled();
     });
 
     it('is a no-op replay for an already-confirmed payment', async () => {
