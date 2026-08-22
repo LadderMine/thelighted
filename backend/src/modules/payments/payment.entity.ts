@@ -64,6 +64,13 @@ export class Payment {
   @Column({ type: 'timestamp', nullable: true })
   confirmedAt: Date | null;
 
+  // Mirrors the built transaction's own Stellar timebounds (issue #314) —
+  // once this passes without an independently-verified confirmation, the
+  // reconciliation job marks the payment EXPIRED rather than polling
+  // forever. Set at PENDING-creation time in PaymentsService.initiate().
+  @Column({ type: 'timestamp', nullable: true })
+  expiresAt: Date | null;
+
   // Populated when status transitions to FAILED — a typed PaymentErrorCode
   // (see errors/payment.errors.ts), not a raw Horizon/stack-trace dump, so
   // it's safe to surface back to the diner-facing client.

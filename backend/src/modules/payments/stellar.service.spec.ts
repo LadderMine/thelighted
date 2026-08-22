@@ -9,6 +9,7 @@ const destinationKeypair = Keypair.random();
 const mockLoadAccount = jest.fn();
 const mockFetchBaseFee = jest.fn();
 const mockSubmitTransaction = jest.fn();
+const mockGetTransaction = jest.fn();
 
 jest.mock('@stellar/stellar-sdk', () => {
   const actual = jest.requireActual('@stellar/stellar-sdk');
@@ -20,6 +21,11 @@ jest.mock('@stellar/stellar-sdk', () => {
         loadAccount: mockLoadAccount,
         fetchBaseFee: mockFetchBaseFee,
         submitTransaction: mockSubmitTransaction,
+        transactions: jest.fn().mockImplementation(() => ({
+          transaction: jest.fn().mockImplementation((hash: string) => ({
+            call: () => mockGetTransaction(hash),
+          })),
+        })),
       })),
     },
   };
@@ -176,6 +182,55 @@ describe('StellarService', () => {
 
       expect(mockSubmitTransaction).toHaveBeenCalledTimes(1);
       expect(result).toEqual({ hash: 'fake-hash', successful: true });
+    });
+  });
+
+  describe('computeTransactionHash', () => {
+    it('computes a deterministic hex hash locally, without any network call', async () => {
+      const service = readyService();
+      mockLoadAccount.mockResolvedValueOnce(
+        new Account(sourceKeypair.publicKey(), '100'),
+      );
+      mockFetchBaseFee.mockResolvedValueOnce(100);
+
+      const xdr = await service.buildPaymentTransaction({
+        sourceAccount: sourceKeypair.publicKey(),
+        destinationAccount: destinationKeypair.publicKey(),
+        assetCode: 'XLM',
+        amount: '1.0000000',
+      });
+
+      const hash = service.computeTransactionHash(xdr);
+
+      expect(hash).toMatch(/^[0-9a-f]{64}$/);
+      expect(mockSubmitTransaction).not.toHaveBeenCalled();
+      // Deterministic: computing it again from the same XDR yields the same hash.
+      expect(service.computeTransactionHash(xdr)).toBe(hash);
+    });
+  });
+
+  describe('fetchTransaction', () => {
+    it('delegates to Horizon transactions().transaction(hash).call()', async () => {
+      const service = readyService();
+      mockGetTransaction.mockResolvedValueOnce({
+        hash: 'abc123',
+        successful: true,
+      });
+
+      const result = await service.fetchTransaction('abc123');
+
+      expect(mockGetTransaction).toHaveBeenCalledWith('abc123');
+      expect(result).toEqual({ hash: 'abc123', successful: true });
+    });
+
+    it('propagates a rejection (e.g. NotFoundError) to the caller', async () => {
+      const service = readyService();
+      const notFound = new Error('not found');
+      mockGetTransaction.mockRejectedValueOnce(notFound);
+
+      await expect(service.fetchTransaction('missing-hash')).rejects.toThrow(
+        'not found',
+      );
     });
   });
 });

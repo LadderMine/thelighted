@@ -2,6 +2,7 @@
 import {
   Body,
   Controller,
+  Get,
   Param,
   Post,
   Request,
@@ -51,6 +52,18 @@ export class PaymentsController {
       req.checkoutContext.orderId,
       dto,
     );
+  }
+
+  // Reconnect-safe status fetch (issue #314 edge case): a client that
+  // disconnects from the payments WebSocket before the confirmation event
+  // arrives must be able to fetch current status directly instead of
+  // relying solely on the push event.
+  @Get(':paymentId')
+  async findOne(
+    @Request() req: CheckoutRequest,
+    @Param('paymentId') paymentId: string,
+  ) {
+    return this.paymentsService.findOne(paymentId, req.checkoutContext.orderId);
   }
 
   // A valid checkout token only ever authorizes the order it was issued

@@ -73,3 +73,19 @@ export function mapHorizonSubmissionError(error: unknown): PaymentError {
     error instanceof Error ? error.message : String(error),
   );
 }
+
+/**
+ * Distinguishes "Horizon told us definitively no" (a structured rejection,
+ * or a confirmed not-found account) from an ambiguous network/timeout
+ * error where we genuinely don't know whether the transaction was applied
+ * (issue #314 edge case). Only a definitive rejection justifies marking a
+ * Payment FAILED immediately from the submit call itself — an ambiguous
+ * error must leave the payment SUBMITTED (it already carries a locally-
+ * computed hash) for PaymentReconciliationService to resolve later by
+ * independently checking Horizon.
+ */
+export function isDefinitiveHorizonRejection(error: unknown): boolean {
+  const data = (error as { response?: { data?: unknown } } | undefined)
+    ?.response?.data;
+  return isTransactionFailedData(data) || error instanceof NotFoundError;
+}
