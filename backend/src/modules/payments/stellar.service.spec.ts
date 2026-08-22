@@ -1,4 +1,4 @@
-import { Account, Keypair, Networks } from '@stellar/stellar-sdk';
+import { Account, Keypair, Networks, NotFoundError } from '@stellar/stellar-sdk';
 import { StellarService } from './stellar.service';
 
 // Real, validly-checksummed keys generated at test time — hand-typed
@@ -231,6 +231,78 @@ describe('StellarService', () => {
       await expect(service.fetchTransaction('missing-hash')).rejects.toThrow(
         'not found',
       );
+    });
+  });
+
+  describe('getAccountTrustlines', () => {
+    it('reports funded:false for an account that does not exist on the network', async () => {
+      const service = readyService();
+      mockLoadAccount.mockRejectedValueOnce(new NotFoundError('not found', {}));
+
+      const result = await service.getAccountTrustlines(
+        sourceKeypair.publicKey(),
+      );
+
+      expect(result).toEqual({ funded: false, balances: [] });
+    });
+
+    it('propagates a non-NotFoundError failure instead of swallowing it', async () => {
+      const service = readyService();
+      const outage = new Error('horizon unreachable');
+      mockLoadAccount.mockRejectedValueOnce(outage);
+
+      await expect(
+        service.getAccountTrustlines(sourceKeypair.publicKey()),
+      ).rejects.toThrow('horizon unreachable');
+    });
+
+    it('maps native and non-native balances to a flat, typed list', async () => {
+      const service = readyService();
+      const issuer = Keypair.random().publicKey();
+      mockLoadAccount.mockResolvedValueOnce({
+        balances: [
+          { asset_type: 'native', balance: '42.0000000' },
+          {
+            asset_type: 'credit_alphanum4',
+            asset_code: 'USDC',
+            asset_issuer: issuer,
+            balance: '10.0000000',
+          },
+        ],
+      });
+
+      const result = await service.getAccountTrustlines(
+        sourceKeypair.publicKey(),
+      );
+
+      expect(result).toEqual({
+        funded: true,
+        balances: [
+          { assetCode: 'XLM', assetIssuer: null, balance: '42.0000000' },
+          { assetCode: 'USDC', assetIssuer: issuer, balance: '10.0000000' },
+        ],
+      });
+    });
+  });
+
+  describe('buildTrustlineTransaction', () => {
+    it('builds a signable changeTrust XDR envelope', async () => {
+      const service = readyService();
+      mockLoadAccount.mockResolvedValueOnce(
+        new Account(sourceKeypair.publicKey(), '100'),
+      );
+      mockFetchBaseFee.mockResolvedValueOnce(100);
+
+      const issuer = Keypair.random().publicKey();
+      const xdr = await service.buildTrustlineTransaction({
+        sourceAccount: sourceKeypair.publicKey(),
+        assetCode: 'USDC',
+        assetIssuer: issuer,
+      });
+
+      expect(typeof xdr).toBe('string');
+      expect(xdr.length).toBeGreaterThan(0);
+      expect(mockLoadAccount).toHaveBeenCalledWith(sourceKeypair.publicKey());
     });
   });
 });
