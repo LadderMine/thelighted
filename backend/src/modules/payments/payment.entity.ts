@@ -47,6 +47,21 @@ export class Payment {
   @Column({ type: 'decimal', precision: 20, scale: 7 })
   amount: number;
 
+  // Portion of `amount` routed to the platform, as a second payment
+  // operation in the SAME diner-signed transaction as the restaurant's
+  // share (issue #316 / ADR 0004) — atomic with the primary payment, never
+  // a separately-failable step. 0 when no platform fee is configured.
+  @Column({ type: 'decimal', precision: 20, scale: 7, default: 0 })
+  platformFeeAmount: number;
+
+  // The platform fee address this payment actually used, recorded even
+  // though it's also in config — config can change after the fact, but a
+  // settled payment's real destination must stay traceable (issue #316
+  // acceptance criteria: "all traceable to one order"). Null when
+  // platformFeeAmount is 0 (no fee collected on this payment).
+  @Column({ type: 'varchar', length: 56, nullable: true })
+  platformFeeDestination: string | null;
+
   @Column({
     type: 'enum',
     enum: PaymentStatus,

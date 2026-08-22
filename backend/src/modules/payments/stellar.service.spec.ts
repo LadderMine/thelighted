@@ -157,6 +157,90 @@ describe('StellarService', () => {
     });
   });
 
+  describe('buildSplitPaymentTransaction (issue #316)', () => {
+    it('builds one Operation.payment per leg in a single atomic transaction', async () => {
+      const service = readyService();
+      mockLoadAccount.mockResolvedValueOnce(
+        new Account(sourceKeypair.publicKey(), '100'),
+      );
+      mockFetchBaseFee.mockResolvedValueOnce(100);
+
+      const feeKeypair = Keypair.random();
+      const xdr = await service.buildSplitPaymentTransaction({
+        sourceAccount: sourceKeypair.publicKey(),
+        assetCode: 'XLM',
+        legs: [
+          { destinationAccount: destinationKeypair.publicKey(), amount: '9.7500000' },
+          { destinationAccount: feeKeypair.publicKey(), amount: '0.2500000' },
+        ],
+      });
+
+      const { TransactionBuilder, Networks: N } = jest.requireActual(
+        '@stellar/stellar-sdk',
+      );
+      const parsed = TransactionBuilder.fromXDR(xdr, N.TESTNET);
+
+      expect(parsed.operations).toHaveLength(2);
+      expect(parsed.operations[0]).toMatchObject({
+        type: 'payment',
+        destination: destinationKeypair.publicKey(),
+        amount: '9.7500000',
+      });
+      expect(parsed.operations[1]).toMatchObject({
+        type: 'payment',
+        destination: feeKeypair.publicKey(),
+        amount: '0.2500000',
+      });
+    });
+
+    it('throws when called with zero legs', async () => {
+      const service = readyService();
+      await expect(
+        service.buildSplitPaymentTransaction({
+          sourceAccount: sourceKeypair.publicKey(),
+          assetCode: 'XLM',
+          legs: [],
+        }),
+      ).rejects.toThrow(/at least one leg is required/);
+      expect(mockLoadAccount).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('signTransactionWithKeypair (issue #316)', () => {
+    it('signs an unsigned envelope, producing a transaction with one more signature', async () => {
+      const service = readyService();
+      mockLoadAccount.mockResolvedValueOnce(
+        new Account(sourceKeypair.publicKey(), '100'),
+      );
+      mockFetchBaseFee.mockResolvedValueOnce(100);
+
+      const unsignedXdr = await service.buildPaymentTransaction({
+        sourceAccount: sourceKeypair.publicKey(),
+        destinationAccount: destinationKeypair.publicKey(),
+        assetCode: 'XLM',
+        amount: '1.0000000',
+      });
+
+      const signedXdr = service.signTransactionWithKeypair(
+        unsignedXdr,
+        sourceKeypair,
+      );
+
+      const { TransactionBuilder, Networks: N } = jest.requireActual(
+        '@stellar/stellar-sdk',
+      );
+      const unsignedParsed = TransactionBuilder.fromXDR(unsignedXdr, N.TESTNET);
+      const signedParsed = TransactionBuilder.fromXDR(signedXdr, N.TESTNET);
+
+      expect(unsignedParsed.signatures).toHaveLength(0);
+      expect(signedParsed.signatures).toHaveLength(1);
+      // Same underlying transaction — signing must not alter its hash.
+      expect(signedParsed.hash().toString('hex')).toBe(
+        unsignedParsed.hash().toString('hex'),
+      );
+    });
+  });
+
   describe('submitTransaction', () => {
     it('parses the signed XDR and submits it to Horizon', async () => {
       const service = readyService();

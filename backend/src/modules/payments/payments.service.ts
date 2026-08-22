@@ -1,5 +1,6 @@
 // backend/src/modules/payments/payments.service.ts
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { QueryFailedError, Repository } from 'typeorm';
 import { Order } from '../orders/order.entity';
@@ -37,6 +38,12 @@ export interface SubmitSignedPaymentResult {
   stellarTxHash: string | null;
 }
 
+interface FeeSplit {
+  netAmount: string;
+  feeAmount: string;
+  feeDestination: string;
+}
+
 @Injectable()
 export class PaymentsService {
   private readonly logger = new Logger(PaymentsService.name);
@@ -51,6 +58,7 @@ export class PaymentsService {
     private readonly stellarService: StellarService,
     private readonly sequenceAllocator: SequenceAllocator,
     private readonly paymentsGateway: PaymentsGateway,
+    private readonly configService: ConfigService,
   ) {}
 
   async initiate(dto: InitiatePaymentDto): Promise<InitiatePaymentResult> {
@@ -82,27 +90,88 @@ export class PaymentsService {
     }
 
     const sequence = await this.sequenceAllocator.allocate(dto.sourceAccount);
-    const unsignedTransactionXdr =
-      await this.stellarService.buildPaymentTransaction({
-        sourceAccount: dto.sourceAccount,
-        destinationAccount: restaurant.stellarWalletAddress,
-        assetCode: dto.assetCode,
-        assetIssuer: dto.assetIssuer,
-        amount: dto.amount,
-        memo: order.orderNumber,
-        sequenceOverride: sequence,
-      });
+    const split = this.computeFeeSplit(dto.amount);
+
+    // Platform fee, when configured, rides as a second Operation.payment
+    // in the SAME diner-signed transaction as the restaurant's share
+    // (issue #316 / ADR 0004) — one signature, atomic: both land or
+    // neither does. No fee configured (the default) is byte-for-byte the
+    // original single-operation transaction.
+    const unsignedTransactionXdr = split
+      ? await this.stellarService.buildSplitPaymentTransaction({
+          sourceAccount: dto.sourceAccount,
+          assetCode: dto.assetCode,
+          assetIssuer: dto.assetIssuer,
+          legs: [
+            {
+              destinationAccount: restaurant.stellarWalletAddress,
+              amount: split.netAmount,
+            },
+            {
+              destinationAccount: split.feeDestination,
+              amount: split.feeAmount,
+            },
+          ],
+          memo: order.orderNumber,
+          sequenceOverride: sequence,
+        })
+      : await this.stellarService.buildPaymentTransaction({
+          sourceAccount: dto.sourceAccount,
+          destinationAccount: restaurant.stellarWalletAddress,
+          assetCode: dto.assetCode,
+          assetIssuer: dto.assetIssuer,
+          amount: dto.amount,
+          memo: order.orderNumber,
+          sequenceOverride: sequence,
+        });
 
     const payment = await this.createPayment(
       dto,
       restaurant,
       unsignedTransactionXdr,
+      split,
     );
 
     return {
       paymentId: payment.id,
       status: payment.status,
       unsignedTransactionXdr,
+    };
+  }
+
+  /**
+   * Returns null when no platform fee is configured (PLATFORM_FEE_STELLAR_ADDRESS
+   * unset or PLATFORM_FEE_BPS <= 0) — the common/default case, which keeps
+   * `initiate()` on the original single-operation transaction path
+   * unchanged. Also returns null (with a warning) if a misconfigured bps
+   * would consume the entire payment, rather than build a transaction
+   * that pays the restaurant nothing.
+   */
+  private computeFeeSplit(amount: string): FeeSplit | null {
+    const feeDestination = this.configService.get<string>(
+      'PLATFORM_FEE_STELLAR_ADDRESS',
+    );
+    const feeBps = Number(
+      this.configService.get<string>('PLATFORM_FEE_BPS', '0'),
+    );
+    if (!feeDestination || !(feeBps > 0)) {
+      return null;
+    }
+
+    const total = Number(amount);
+    const fee = Math.round(((total * feeBps) / 10_000) * 1e7) / 1e7;
+    if (fee <= 0 || fee >= total) {
+      this.logger.warn(
+        `Ignoring platform fee config: computed fee ${fee} is invalid for amount ${amount} (PLATFORM_FEE_BPS=${feeBps})`,
+      );
+      return null;
+    }
+
+    const net = Math.round((total - fee) * 1e7) / 1e7;
+    return {
+      netAmount: net.toFixed(7),
+      feeAmount: fee.toFixed(7),
+      feeDestination,
     };
   }
 
@@ -115,6 +184,7 @@ export class PaymentsService {
     dto: InitiatePaymentDto,
     restaurant: Restaurant,
     unsignedTransactionXdr: string,
+    split: FeeSplit | null,
   ): Promise<Payment> {
     const payment = this.paymentRepository.create({
       orderId: dto.orderId,
@@ -126,6 +196,8 @@ export class PaymentsService {
       status: PaymentStatus.PENDING,
       horizonEnvelopeXdr: unsignedTransactionXdr,
       expiresAt: new Date(Date.now() + TRANSACTION_TIMEOUT_SECONDS * 1000),
+      platformFeeAmount: split ? Number(split.feeAmount) : 0,
+      platformFeeDestination: split ? split.feeDestination : null,
     });
 
     try {

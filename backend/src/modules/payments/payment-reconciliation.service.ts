@@ -4,10 +4,11 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { LessThan, Repository } from 'typeorm';
 import { NotFoundError } from '@stellar/stellar-sdk';
-import { Order } from '../orders/order.entity';
+import { Order, OrderStatus } from '../orders/order.entity';
 import { Payment, PaymentStatus } from './payment.entity';
 import { StellarService } from './stellar.service';
 import { PaymentsGateway } from './payments.gateway';
+import { LoyaltyPayoutService } from './loyalty-payout.service';
 import { assertValidTransition } from './payment-state-machine';
 
 export interface ReconciliationSummary {
@@ -53,6 +54,7 @@ export class PaymentReconciliationService {
     private readonly orderRepository: Repository<Order>,
     private readonly stellarService: StellarService,
     private readonly paymentsGateway: PaymentsGateway,
+    private readonly loyaltyPayoutService: LoyaltyPayoutService,
   ) {}
 
   @Cron(CronExpression.EVERY_10_SECONDS)
@@ -132,6 +134,23 @@ export class PaymentReconciliationService {
         `Payment ${saved.id} reconciled to ${saved.status} (tx ${payment.stellarTxHash})`,
       );
       await this.emitStatusChanged(saved);
+
+      if (saved.status === PaymentStatus.CONFIRMED) {
+        // Distinct, independently-retryable concerns from the payment
+        // itself (issue #316 / ADR 0004) — a hiccup in either must never
+        // roll back or block the payment's own CONFIRMED status, which is
+        // already durably saved above.
+        await this.markOrderPaid(saved.orderId);
+        try {
+          await this.loyaltyPayoutService.createForConfirmedPayment(saved);
+        } catch (error) {
+          this.logger.error(
+            `Failed to create loyalty payout for payment ${saved.id} (order ${saved.orderId}): ` +
+              (error instanceof Error ? error.message : String(error)),
+          );
+        }
+      }
+
       return saved;
     } catch (error) {
       if (error instanceof NotFoundError) {
@@ -191,6 +210,26 @@ export class PaymentReconciliationService {
       await this.emitStatusChanged(saved);
       summary.expired++;
     }
+  }
+
+  /**
+   * A confirmed payment flips its order from PENDING to CONFIRMED — "paid"
+   * (issue #316: the order-marked-paid step of the settlement flow). Only
+   * ever advances from PENDING: if staff already moved the order further
+   * (PREPARING, etc.) or it was somehow already CONFIRMED, reconciliation
+   * re-running this (idempotent by construction, since a Payment only
+   * reaches CONFIRMED once — see payment-state-machine.ts) must never
+   * clobber a status the kitchen workflow has since moved past.
+   */
+  private async markOrderPaid(orderId: string): Promise<void> {
+    const order = await this.orderRepository.findOne({
+      where: { id: orderId },
+    });
+    if (!order || order.status !== OrderStatus.PENDING) return;
+
+    order.status = OrderStatus.CONFIRMED;
+    await this.orderRepository.save(order);
+    this.logger.log(`Order ${orderId} marked paid (status -> CONFIRMED)`);
   }
 
   private async emitStatusChanged(payment: Payment): Promise<void> {
