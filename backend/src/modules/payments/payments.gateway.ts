@@ -10,6 +10,7 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import { PaymentStatus } from './payment.entity';
+import { LoyaltyPayoutStatus } from './loyalty-payout.entity';
 
 interface PaymentSocketUser {
   sub: string;
@@ -22,6 +23,16 @@ export interface PaymentStatusChangedEvent {
   paymentId: string;
   orderId: string;
   status: PaymentStatus;
+  stellarTxHash: string | null;
+  failureReason: string | null;
+  updatedAt: string;
+}
+
+export interface LoyaltyPayoutStatusChangedEvent {
+  payoutId: string;
+  paymentId: string;
+  orderId: string;
+  status: LoyaltyPayoutStatus;
   stellarTxHash: string | null;
   failureReason: string | null;
   updatedAt: string;
@@ -99,5 +110,14 @@ export class PaymentsGateway
     this.server
       .to(restaurantRoom(restaurantId))
       .emit('payment:status_changed', event);
+  }
+
+  emitLoyaltyPayoutStatusChanged(
+    restaurantId: string,
+    event: LoyaltyPayoutStatusChangedEvent,
+  ): void {
+    this.server
+      .to(restaurantRoom(restaurantId))
+      .emit('payout:status_changed', event);
   }
 }

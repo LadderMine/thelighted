@@ -5,10 +5,12 @@ import {
   Account,
   Asset,
   Horizon,
+  Keypair,
   Memo,
   Networks,
   NotFoundError,
   Operation,
+  Transaction,
   TransactionBuilder,
 } from '@stellar/stellar-sdk';
 
@@ -30,6 +32,22 @@ export interface BuildPaymentTransactionParams {
    * this must not also expect the usual +1 — buildPaymentTransaction
    * compensates by constructing the Account one below this value.
    */
+  sequenceOverride?: string;
+}
+
+export interface PaymentSplitLeg {
+  destinationAccount: string;
+  /** Decimal string, e.g. "12.5000000" — never a float. */
+  amount: string;
+}
+
+export interface BuildSplitPaymentTransactionParams {
+  sourceAccount: string;
+  assetCode: string;
+  assetIssuer?: string;
+  /** One `Operation.payment` per leg, all sharing one asset/source/signature (issue #316 / ADR 0004) — e.g. [restaurant net amount, platform fee]. At least one leg required. */
+  legs: PaymentSplitLeg[];
+  memo?: string;
   sequenceOverride?: string;
 }
 
@@ -127,6 +145,40 @@ export class StellarService implements OnModuleInit {
   async buildPaymentTransaction(
     params: BuildPaymentTransactionParams,
   ): Promise<string> {
+    return this.buildMultiOperationPayment({
+      sourceAccount: params.sourceAccount,
+      assetCode: params.assetCode,
+      assetIssuer: params.assetIssuer,
+      legs: [
+        { destinationAccount: params.destinationAccount, amount: params.amount },
+      ],
+      memo: params.memo,
+      sequenceOverride: params.sequenceOverride,
+    });
+  }
+
+  /**
+   * Builds an unsigned transaction with one `Operation.payment` per leg,
+   * all sharing a single source/asset/signature — e.g. a diner's payment
+   * split into a restaurant-net-amount leg and a platform-fee leg in one
+   * atomic, once-signed transaction (issue #316 / ADR 0004: "so it can't
+   * partially apply"). Returns a base64 XDR envelope, same as
+   * buildPaymentTransaction.
+   */
+  async buildSplitPaymentTransaction(
+    params: BuildSplitPaymentTransactionParams,
+  ): Promise<string> {
+    if (params.legs.length === 0) {
+      throw new Error(
+        'StellarService.buildSplitPaymentTransaction: at least one leg is required',
+      );
+    }
+    return this.buildMultiOperationPayment(params);
+  }
+
+  private async buildMultiOperationPayment(
+    params: BuildSplitPaymentTransactionParams,
+  ): Promise<string> {
     const sourceAccount = params.sequenceOverride
       ? new Account(
           params.sourceAccount,
@@ -139,21 +191,42 @@ export class StellarService implements OnModuleInit {
         ? Asset.native()
         : new Asset(params.assetCode, params.assetIssuer);
 
-    const transaction = new TransactionBuilder(sourceAccount, {
+    let builder = new TransactionBuilder(sourceAccount, {
       fee: String(baseFee),
       networkPassphrase: this.networkPassphrase,
-    })
-      .addOperation(
+    });
+
+    for (const leg of params.legs) {
+      builder = builder.addOperation(
         Operation.payment({
-          destination: params.destinationAccount,
+          destination: leg.destinationAccount,
           asset,
-          amount: params.amount,
+          amount: leg.amount,
         }),
-      )
+      );
+    }
+
+    const transaction = builder
       .addMemo(params.memo ? Memo.text(params.memo) : Memo.none())
       .setTimeout(TRANSACTION_TIMEOUT_SECONDS)
       .build();
 
+    return transaction.toXDR();
+  }
+
+  /**
+   * Signs an unsigned transaction envelope with a platform-held Keypair —
+   * the ONLY place StellarService touches a private key directly (issue
+   * #316 / ADR 0004: loyalty payouts are a platform-signed transaction,
+   * unlike the diner-signed primary payment ADR 0001 covers). Callers own
+   * the Keypair's lifecycle; this method never logs or persists it.
+   */
+  signTransactionWithKeypair(unsignedXdr: string, keypair: Keypair): string {
+    const transaction = TransactionBuilder.fromXDR(
+      unsignedXdr,
+      this.networkPassphrase,
+    ) as Transaction;
+    transaction.sign(keypair);
     return transaction.toXDR();
   }
 

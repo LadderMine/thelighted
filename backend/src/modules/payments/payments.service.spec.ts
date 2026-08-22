@@ -37,11 +37,13 @@ describe('PaymentsService', () => {
   let restaurantRepository: MockRepository;
   let stellarService: {
     buildPaymentTransaction: jest.Mock;
+    buildSplitPaymentTransaction: jest.Mock;
     submitTransaction: jest.Mock;
     computeTransactionHash: jest.Mock;
   };
   let sequenceAllocator: { allocate: jest.Mock; invalidate: jest.Mock };
   let paymentsGateway: { emitPaymentStatusChanged: jest.Mock };
+  let configService: { get: jest.Mock };
   let service: PaymentsService;
 
   const order = {
@@ -65,6 +67,9 @@ describe('PaymentsService', () => {
     restaurantRepository = makeRepository();
     stellarService = {
       buildPaymentTransaction: jest.fn().mockResolvedValue('unsigned-xdr'),
+      buildSplitPaymentTransaction: jest
+        .fn()
+        .mockResolvedValue('unsigned-split-xdr'),
       submitTransaction: jest.fn(),
       computeTransactionHash: jest
         .fn()
@@ -75,6 +80,9 @@ describe('PaymentsService', () => {
       invalidate: jest.fn(),
     };
     paymentsGateway = { emitPaymentStatusChanged: jest.fn() };
+    // No platform fee configured by default — every existing test below
+    // exercises the original, unchanged single-operation transaction path.
+    configService = { get: jest.fn().mockReturnValue(undefined) };
 
     service = new PaymentsService(
       paymentRepository as any,
@@ -83,6 +91,7 @@ describe('PaymentsService', () => {
       stellarService as any,
       sequenceAllocator as any,
       paymentsGateway as any,
+      configService as any,
     );
 
     paymentRepository.findOne.mockResolvedValue(null);
@@ -190,6 +199,72 @@ describe('PaymentsService', () => {
       const result = await service.initiate(baseDto);
 
       expect(result.paymentId).toBe('raced-in-payment');
+    });
+  });
+
+  describe('initiate — platform fee split (issue #316)', () => {
+    function withFeeConfig(address: string | undefined, bps: string) {
+      configService.get.mockImplementation((key: string, fallback?: string) => {
+        if (key === 'PLATFORM_FEE_STELLAR_ADDRESS') return address;
+        if (key === 'PLATFORM_FEE_BPS') return bps;
+        return fallback;
+      });
+    }
+
+    it('builds a split transaction with restaurant net + platform fee legs when a fee is configured', async () => {
+      withFeeConfig('GPLATFORMFEE...', '250'); // 2.5%
+
+      const result = await service.initiate(baseDto);
+
+      expect(stellarService.buildSplitPaymentTransaction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sourceAccount: 'GSOURCE...',
+          assetCode: 'XLM',
+          legs: [
+            { destinationAccount: 'GDEST...', amount: '9.7500000' },
+            { destinationAccount: 'GPLATFORMFEE...', amount: '0.2500000' },
+          ],
+          sequenceOverride: '101',
+        }),
+      );
+      expect(stellarService.buildPaymentTransaction).not.toHaveBeenCalled();
+      expect(paymentRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          platformFeeAmount: 0.25,
+          platformFeeDestination: 'GPLATFORMFEE...',
+        }),
+      );
+      expect(result.unsignedTransactionXdr).toBe('unsigned-split-xdr');
+    });
+
+    it('falls back to the original single-operation transaction when no fee address is configured', async () => {
+      withFeeConfig(undefined, '250');
+
+      await service.initiate(baseDto);
+
+      expect(stellarService.buildSplitPaymentTransaction).not.toHaveBeenCalled();
+      expect(stellarService.buildPaymentTransaction).toHaveBeenCalled();
+      expect(paymentRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({ platformFeeAmount: 0, platformFeeDestination: null }),
+      );
+    });
+
+    it('falls back to the original transaction when the fee bps is zero', async () => {
+      withFeeConfig('GPLATFORMFEE...', '0');
+
+      await service.initiate(baseDto);
+
+      expect(stellarService.buildSplitPaymentTransaction).not.toHaveBeenCalled();
+      expect(stellarService.buildPaymentTransaction).toHaveBeenCalled();
+    });
+
+    it('ignores a misconfigured fee that would consume the entire payment rather than pay the restaurant nothing', async () => {
+      withFeeConfig('GPLATFORMFEE...', '10000'); // 100% — pathological
+
+      await service.initiate(baseDto);
+
+      expect(stellarService.buildSplitPaymentTransaction).not.toHaveBeenCalled();
+      expect(stellarService.buildPaymentTransaction).toHaveBeenCalled();
     });
   });
 

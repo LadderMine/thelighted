@@ -1,6 +1,7 @@
 import { NotFoundError } from '@stellar/stellar-sdk';
 import { PaymentReconciliationService } from './payment-reconciliation.service';
 import { Payment, PaymentStatus } from './payment.entity';
+import { OrderStatus } from '../orders/order.entity';
 
 type MockRepository = {
   find: jest.Mock;
@@ -42,6 +43,7 @@ describe('PaymentReconciliationService', () => {
   let orderRepository: MockRepository;
   let stellarService: { fetchTransaction: jest.Mock };
   let paymentsGateway: { emitPaymentStatusChanged: jest.Mock };
+  let loyaltyPayoutService: { createForConfirmedPayment: jest.Mock };
   let service: PaymentReconciliationService;
 
   beforeEach(() => {
@@ -49,10 +51,12 @@ describe('PaymentReconciliationService', () => {
     orderRepository = makeRepository();
     stellarService = { fetchTransaction: jest.fn() };
     paymentsGateway = { emitPaymentStatusChanged: jest.fn() };
+    loyaltyPayoutService = { createForConfirmedPayment: jest.fn() };
 
     orderRepository.findOne.mockResolvedValue({
       id: 'order-1',
       restaurantId: 'restaurant-1',
+      status: OrderStatus.PENDING,
     });
 
     service = new PaymentReconciliationService(
@@ -60,6 +64,7 @@ describe('PaymentReconciliationService', () => {
       orderRepository as any,
       stellarService as any,
       paymentsGateway as any,
+      loyaltyPayoutService as any,
     );
   });
 
@@ -160,6 +165,99 @@ describe('PaymentReconciliationService', () => {
 
       expect(secondSummary.confirmed).toBe(0);
       expect(stellarService.fetchTransaction).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('reconcile — order-paid flip and loyalty payout trigger (issue #316)', () => {
+    it('flips the order from PENDING to CONFIRMED ("paid") once the payment confirms', async () => {
+      const payment = makePayment();
+      paymentRepository.find
+        .mockResolvedValueOnce([payment])
+        .mockResolvedValueOnce([]);
+      stellarService.fetchTransaction.mockResolvedValueOnce({
+        hash: 'tx-hash-1',
+        successful: true,
+      });
+
+      await service.reconcile();
+
+      expect(orderRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'order-1', status: OrderStatus.CONFIRMED }),
+      );
+    });
+
+    it('does not touch an order the kitchen has already moved past PENDING (idempotent re-run safety)', async () => {
+      orderRepository.findOne.mockResolvedValue({
+        id: 'order-1',
+        restaurantId: 'restaurant-1',
+        status: OrderStatus.PREPARING,
+      });
+      const payment = makePayment();
+      paymentRepository.find
+        .mockResolvedValueOnce([payment])
+        .mockResolvedValueOnce([]);
+      stellarService.fetchTransaction.mockResolvedValueOnce({
+        hash: 'tx-hash-1',
+        successful: true,
+      });
+
+      await service.reconcile();
+
+      expect(orderRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('creates a loyalty payout when a payment confirms', async () => {
+      const payment = makePayment();
+      paymentRepository.find
+        .mockResolvedValueOnce([payment])
+        .mockResolvedValueOnce([]);
+      stellarService.fetchTransaction.mockResolvedValueOnce({
+        hash: 'tx-hash-1',
+        successful: true,
+      });
+
+      await service.reconcile();
+
+      expect(loyaltyPayoutService.createForConfirmedPayment).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'payment-1', status: PaymentStatus.CONFIRMED }),
+      );
+    });
+
+    it('does not create a loyalty payout when a payment fails, only on confirmation', async () => {
+      const payment = makePayment();
+      paymentRepository.find
+        .mockResolvedValueOnce([payment])
+        .mockResolvedValueOnce([]);
+      stellarService.fetchTransaction.mockResolvedValueOnce({
+        hash: 'tx-hash-1',
+        successful: false,
+      });
+
+      await service.reconcile();
+
+      expect(loyaltyPayoutService.createForConfirmedPayment).not.toHaveBeenCalled();
+      expect(orderRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('does not let a loyalty payout creation failure roll back the already-saved CONFIRMED payment status', async () => {
+      loyaltyPayoutService.createForConfirmedPayment.mockRejectedValueOnce(
+        new Error('payout service unavailable'),
+      );
+      const payment = makePayment();
+      paymentRepository.find
+        .mockResolvedValueOnce([payment])
+        .mockResolvedValueOnce([]);
+      stellarService.fetchTransaction.mockResolvedValueOnce({
+        hash: 'tx-hash-1',
+        successful: true,
+      });
+
+      const summary = await service.reconcile();
+
+      expect(summary.confirmed).toBe(1);
+      expect(paymentRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({ status: PaymentStatus.CONFIRMED }),
+      );
     });
   });
 
